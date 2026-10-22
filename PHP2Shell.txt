@@ -1,0 +1,444 @@
+# =====================================================================
+#  Mitigazione tramite per CVE-2026-109618 / CVE-2026-109619 ("PHP2Shell")
+#  Apache HTTP Server + ModSecurity 2.x  (mod_security2)
+# =====================================================================
+#
+#  COSA SONO QUESTE VULNERABILITA'
+#  -------------------------------
+#
+#  !!! LIMITI di queste rule !!!
+#  La mitigazione completa per CVE-2026-109618 / CVE-2026-109619 e' AGGIORNARE PHP e riavviare i worker.
+#  Un WAF in questo caso puo' solo
+#  ridurre la superficie d'attacco bloccando le condizioni che portano
+#  PHP in OOM (richieste multipart anomale) e rilevare gli effetti
+#  (cookie PHPSESSID anomali, raffiche di HTTP 500).
+#
+#  COME USARLO
+#  -----------
+#  1. Salva il file (es. /etc/modsecurity/php-oom-cve-2026-109618.conf)
+#  2. Includilo nella configurazione Apache DOPO modsecurity.conf e,
+#     se presente, DOPO la OWASP CRS:
+#         Include /etc/modsecurity/php-oom-cve-2026-109618.conf
+#  3. Verifica la sintassi:        apachectl configtest
+#  4. PARTI IN MODALITA' SOLO-RILEVAMENTO (vedi sezione 0) e controlla
+#     /var/log/apache2/modsec_audit.log per qualche giorno.
+#  5. Passa al blocco solo dopo aver tarato le soglie sui TUOI form.
+#
+#  RANGE ID: 9100000-9100099 (riservato alle regole custom; cambia se
+#  collide con altre tue regole).
+# =====================================================================
+
+
+# =====================================================================
+# SEZIONE 0 - MODALITA' DI FUNZIONAMENTO
+# =====================================================================
+# DetectionOnly = le regole scrivono nel log ma NON bloccano nulla.
+# Usalo per la fase di test. Quando sei sicuro, sostituiscilo con "On".
+# (Se hai gia' SecRuleEngine in modsecurity.conf, NON duplicarlo qui:
+#  modificalo li' e lascia questa riga commentata.)
+#
+# SecRuleEngine DetectionOnly
+
+
+# =====================================================================
+# SEZIONE 1 - PREREQUISITI E LIMITI GLOBALI
+# =====================================================================
+
+# Senza questa direttiva ModSecurity NON legge il body delle richieste,
+# quindi non vedrebbe campi POST, parti multipart e nomi dei file.
+SecRequestBodyAccess On
+
+# Dimensione massima totale del body (file inclusi): 10 MB.
+# DEVE essere allineata a post_max_size di php.ini. Il WAF la applica
+# sul body "reale" ricevuto, anche se la richiesta non dichiara una
+# lunghezza: e' proprio il caso che l'advisory indica come trucco per
+# aggirare il controllo iniziale di post_max_size.
+SecRequestBodyLimit 10485760
+
+# Dimensione massima del body ESCLUSI i file caricati (form di testo,
+# JSON, ecc.): 128 KB. Un body "da OOM" fatto di tanti campi enormi
+# viene fermato qui.
+SecRequestBodyNoFilesLimit 131072
+
+# Cosa fare se un limite viene superato:
+#   Reject          = rifiuta subito la richiesta (413)  <-- consigliato
+#   ProcessPartial  = processa solo la parte che sta nel limite (pericoloso:
+#                     il resto passerebbe a PHP non ispezionato)
+SecRequestBodyLimitAction Reject
+
+# Numero massimo di argomenti (GET + POST) analizzati. Un attacco che
+# moltiplica i campi per far crescere la memoria viene fermato.
+# Allinea (o tieni <=) a max_input_vars di php.ini.
+SecArgumentsLimit 500
+
+# Cartella dove ModSecurity salva i dati persistenti (collezioni "ip"
+# usate nella sezione 7). Deve esistere ed essere scrivibile dall'utente
+# con cui gira Apache (www-data / apache). Se hai gia' una SecDataDir
+# in modsecurity.conf, NON ripeterla.
+# SecDataDir /var/cache/modsecurity
+
+# Se ModSecurity non riesce a interpretare il body (multipart malformato,
+# limite superato, ecc.) imposta REQBODY_ERROR != 0. Una richiesta il cui
+# body non e' interpretabile dal WAF potrebbe essere interpretata
+# diversamente da PHP: meglio fermarla. (La CRS ha una regola analoga;
+# avere un duplicato e' innocuo.)
+SecRule REQBODY_ERROR "!@eq 0" \
+    "id:9100005,\
+    phase:2,\
+    deny,\
+    status:400,\
+    log,\
+    auditlog,\
+    msg:'Body della richiesta non interpretabile dal WAF: %{REQBODY_ERROR_MSG}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    severity:'CRITICAL'"
+
+
+# =====================================================================
+# SEZIONE 2 - STRATEGIA OOM n.1: MULTIPART SENZA LUNGHEZZA DICHIARATA
+# =====================================================================
+# Un body multipart senza un Content-Length affidabile puo' superare il
+# controllo iniziale di post_max_size e continuare a fornire dati
+# decodificati fino a esaurire la memoria.
+# I client legittimi (browser, curl -F) inviano SEMPRE il Content-Length
+# per i form multipart, quindi bloccare i casi anomali ha pochi falsi
+# positivi.
+
+# --- 2a. multipart + Transfer-Encoding: chunked ----------------------
+# "chunked" significa che la lunghezza non e' dichiarata in anticipo.
+# phase:1  -> valutata appena arrivano gli header, prima del body.
+# deny     -> blocca. status:400 -> risposta "Bad Request".
+# chain    -> la regola scatta solo se ENTRAMBE le condizioni sono vere:
+#             (1) Content-Type e' multipart/*  E  (2) e' chunked.
+# t:none   -> nessuna trasformazione: confronto sul valore originale.
+SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^multipart/" \
+    "id:9100010,\
+    phase:1,\
+    deny,\
+    status:400,\
+    log,\
+    auditlog,\
+    t:none,\
+    msg:'PHP OOM (CVE-2026-109618/109619): multipart con Transfer-Encoding chunked',\
+    logdata:'Content-Type: %{REQUEST_HEADERS.Content-Type}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL',\
+    chain"
+    SecRule REQUEST_HEADERS:Transfer-Encoding "@rx (?i)chunked" "t:none"
+
+# --- 2b. multipart + Content-Length assente --------------------------
+# "&" davanti a una variabile = CONTA quante occorrenze esistono.
+# &REQUEST_HEADERS:Content-Length == 0  ->  l'header non c'e'.
+SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^multipart/" \
+    "id:9100011,\
+    phase:1,\
+    deny,\
+    status:411,\
+    log,\
+    auditlog,\
+    t:none,\
+    msg:'PHP OOM (CVE-2026-109618/109619): multipart senza Content-Length',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL',\
+    chain"
+    SecRule &REQUEST_HEADERS:Content-Length "@eq 0"
+
+
+# =====================================================================
+# SEZIONE 3 - STRATEGIA OOM n.2: TROPPI HEADER NELLE PARTI MULTIPART
+# =====================================================================
+# Ogni parte di un body multipart puo' avere i propri header. PHP li
+# rappresenta internamente con MOLTA piu' memoria di quanta ne occupino
+# "sul filo": una richiesta dentro post_max_size puo' cosi' esaurire
+# memory_limit. Un form normale ha 1-3 header per parte (Content-
+# Disposition, a volte Content-Type).
+#
+# MULTIPART_PART_HEADERS contiene gli header di TUTTE le parti; "&" ne
+# conta le righe totali. La soglia (60) e' GLOBALE sull'intera richiesta:
+# se hai form con molte parti (es. 30 campi * 2 header = 60) ALZALA.
+# Taratura: guarda i log in DetectionOnly e scegli una soglia sopra il
+# massimo legittimo osservato.
+SecRule &MULTIPART_PART_HEADERS "@gt 60" \
+    "id:9100012,\
+    phase:2,\
+    deny,\
+    status:413,\
+    log,\
+    auditlog,\
+    msg:'PHP OOM (CVE-2026-109618/109619): numero anomalo di header nelle parti multipart',\
+    logdata:'Header multipart: %{MATCHED_VAR}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL'"
+
+
+# =====================================================================
+# SEZIONE 4 - STRATEGIA OOM n.3: CONTROLLI FILE VUOTI IN ECCESSO
+# =====================================================================
+# I campi <input type="file"> lasciati vuoti (filename="") NON contano
+# per max_file_uploads, ma PHP crea comunque le strutture di metadati.
+# Con nomi di campo annidati il lavoro si moltiplica.
+# Un form reale ha pochi file input vuoti: oltre 5 e' sospetto.
+#
+# Si fa in due passi perche' ModSecurity non conta le occorrenze di una
+# regex dentro una stringa, ma sa contare i MATCH su piu' elementi:
+#
+#  Passo 1: per OGNI parte multipart il cui filename e' vuoto,
+#           incrementa il contatore TX:EMPTY_FILE_PARTS.
+#           pass,nolog = non blocca e non scrive nel log (solo conteggio).
+#           \x22 = il carattere " (evita problemi di escaping nelle virgolette)
+SecRule MULTIPART_PART_HEADERS "@rx (?i)filename\s*=\s*\x22\x22" \
+    "id:9100013,\
+    phase:2,\
+    pass,\
+    nolog,\
+    t:none,\
+    setvar:'tx.empty_file_parts=+1'"
+
+#  Passo 2: se il contatore supera la soglia, blocca.
+#           Alza il valore se hai form con tanti campi file opzionali.
+SecRule TX:EMPTY_FILE_PARTS "@gt 5" \
+    "id:9100014,\
+    phase:2,\
+    deny,\
+    status:413,\
+    log,\
+    auditlog,\
+    msg:'PHP OOM (CVE-2026-109618/109619): troppi campi file vuoti nel multipart',\
+    logdata:'Campi file vuoti: %{TX.EMPTY_FILE_PARTS}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL'"
+
+
+# =====================================================================
+# SEZIONE 5 - NOMI dei campi annidati ECCESSIVAMENTE
+# =====================================================================
+# PHP trasforma nomi come  a[b][c][d]  in array annidati. L'advisory
+# consiglia di ridurre max_input_nesting_level (default 64) proprio
+# perche' l'annidamento moltiplica la memoria usata.
+# La regex trova 4 o piu' coppie di parentesi quadre consecutive:
+#     a[x][y][z][w]   -> bloccato        a[x][y]  -> permesso
+# ATTENZIONE: alcune app (page builder, form dinamici, WooCommerce,
+# Drupal Webform) usano nesting profondo legittimamente: verifica in
+# DetectionOnly e alza {4,} se necessario.
+SecRule ARGS_NAMES "@rx (?:\[[^\]]*\]){4,}" \
+    "id:9100015,\
+    phase:2,\
+    deny,\
+    status:400,\
+    log,\
+    auditlog,\
+    t:none,\
+    msg:'PHP OOM (CVE-2026-109618/109619): annidamento anomalo dei nomi campo',\
+    logdata:'Campo: %{MATCHED_VAR_NAME}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL'"
+
+
+# =====================================================================
+# SEZIONE 6 - UPLOAD-PROGRESS delle SESSIONI (solo se NON lo usi)
+# =====================================================================
+# NOTA DI TRASPARENZA: questa regola e' una mia INFERENZA dal blog Wiz
+# (PHP2Shell), non una mitigazione ufficiale dell'advisory.
+# Wiz descrive il percorso del bug di memory disclosure cosi': durante
+# il parsing multipart PHP inizializza la gestione "upload progress"
+# della sessione, e li' un OOM lascia un puntatore pendente.
+# Quel meccanismo si attiva solo se la richiesta contiene un campo con
+# il nome configurato in session.upload_progress.name (default:
+# PHP_SESSION_UPLOAD_PROGRESS). Se la tua app NON usa la barra di
+# avanzamento upload basata su sessione, nessun client legittimo
+# invia quel campo -> la regola e' a rischio-falsi-positivi quasi nullo.
+#
+# Alternativa/aggiunta lato PHP:  session.upload_progress.enabled = 0
+# Se hai cambiato session.upload_progress.name, adatta la regex.
+SecRule ARGS_NAMES|MULTIPART_PART_HEADERS "@rx (?i)PHP_SESSION_UPLOAD_PROGRESS" \
+    "id:9100016,\
+    phase:2,\
+    deny,\
+    status:403,\
+    log,\
+    auditlog,\
+    msg:'Campo upload-progress di sessione PHP non usato: possibile sfruttamento CVE-2026-109618',\
+    tag:'CVE-2026-109618',\
+    tag:'attack-virtual-patch',\
+    severity:'CRITICAL'"
+
+
+# =====================================================================
+# SEZIONE 7 - Rilevamento degli effetti
+# =====================================================================
+
+# --- 7a. Cookie PHPSESSID anomalo nella RISPOSTA ---------------------
+# Il blog Wiz descrive la memory disclosure cosi': PHP prende memoria
+# "riciclata" del worker e la codifica in URL-encoding dentro il
+# cookie PHPSESSID della risposta. Un ID di sessione legittimo e'
+# composto solo da lettere, cifre, virgola e trattino: NON contiene mai
+# sequenze %XX. Se compare, e' quasi certamente un leak di memoria.
+#
+# phase:3  -> fase degli header di risposta (l'app ha gia' risposto ma
+#             la risposta non e' ancora stata inviata al client).
+# deny     -> la risposta NON raggiunge il client: il dato esfiltrato
+#             viene perso. Si usa 403 (non 500) per non alimentare il
+#             contatore di errori della regola 7b.
+# Nota: l'IP andrebbe comunque investigato e il worker riavviato.
+SecRule RESPONSE_HEADERS:Set-Cookie "@rx (?i)\bPHPSESSID=[^;]*%[0-9a-f]{2}" \
+    "id:9100020,\
+    phase:3,\
+    deny,\
+    status:403,\
+    log,\
+    auditlog,\
+    msg:'Cookie PHPSESSID anomalo in risposta: possibile memory disclosure (CVE-2026-109618)',\
+    tag:'CVE-2026-109618',\
+    tag:'attack-detection',\
+    severity:'CRITICAL'"
+
+# --- 7b. Raffiche di HTTP 500 dallo stesso IP ------------------------
+# Provocare un OOM significa far fallire richieste: l'attaccante genera
+# molti HTTP 500 (e worker che muoiono/si riavviano). Tre regole
+# cooperano:
+#
+#  (1) A OGNI richiesta carica/crea il "contatore persistente" di quell'IP.
+#      Deve stare in phase:1 e PRIMA delle altre due.
+SecAction "id:9100030,\
+    phase:1,\
+    pass,\
+    nolog,\
+    initcol:ip=%{REMOTE_ADDR}"
+
+#  (2) Se la risposta e' 500, incrementa il contatore dell'IP.
+#      expirevar = il contatore si azzera dopo 300 secondi (5 minuti).
+SecRule RESPONSE_STATUS "@eq 500" \
+    "id:9100031,\
+    phase:3,\
+    pass,\
+    nolog,\
+    setvar:ip.php500=+1,\
+    expirevar:ip.php500=300"
+
+#  (3) Se lo stesso IP ha causato piu' di 5 errori 500 in 5 minuti,
+#      blocca le sue nuove richieste con 429 (Too Many Requests).
+#      Soglia da tarare: se la tua app genera 500 legittimi, alzala.
+#      ATTENZIONE: se dietro un reverse proxy/CDN, REMOTE_ADDR e' l'IP
+#      del proxy! Configura mod_remoteip e usa l'IP reale del client.
+SecRule IP:PHP500 "@gt 5" \
+    "id:9100032,\
+    phase:1,\
+    deny,\
+    status:429,\
+    log,\
+    auditlog,\
+    msg:'Raffica di HTTP 500 dallo stesso IP: possibile tentativo di OOM (CVE-2026-109618/109619)',\
+    logdata:'Errori 500 negli ultimi 5 minuti: %{IP.PHP500}',\
+    tag:'CVE-2026-109618',\
+    tag:'CVE-2026-109619',\
+    tag:'attack-detection',\
+    severity:'WARNING'"
+
+
+# =====================================================================
+# SEZIONE 8 (OPZIONALE) - NIENTE MULTIPART DOVE NON SERVE
+# =====================================================================
+# Se solo POCHI endpoint accettano upload/form multipart, e' la
+# mitigazione piu' efficace: l'advisory stessa consiglia di bloccare il
+# multipart sul frontend se l'app non lo usa.
+# DECOMMENTA e adatta l'allowlist ai tuoi endpoint legittimi.
+#
+# Come funziona: se la richiesta e' multipart/form-data E l'URI NON
+# inizia con uno dei prefissi consentiti -> blocca (415).
+# "!@rx" = la regex NON deve combaciare.
+#
+# SecRule REQUEST_HEADERS:Content-Type "@rx (?i)^multipart/form-data" \
+#     "id:9100040,\
+#     phase:1,\
+#     deny,\
+#     status:415,\
+#     log,\
+#     auditlog,\
+#     t:none,\
+#     msg:'Multipart non consentito su questo endpoint (mitigazione CVE-2026-109618/109619)',\
+#     tag:'CVE-2026-109618',\
+#     tag:'CVE-2026-109619',\
+#     severity:'CRITICAL',\
+#     chain"
+#     SecRule REQUEST_URI "!@rx ^/(upload/|wp-admin/async-upload\.php|wp-admin/media-new\.php)"
+
+
+# =====================================================================
+# SEZIONE 9 - HARDENING lato APACHE e PHP (attività complementare al WAF)
+# =====================================================================
+# --- Apache (httpd.conf / vhost) -------------------------------------
+# Limite sul body applicato da Apache stesso, indipendente da
+# ModSecurity e valido anche per body chunked (10 MB). Decommenta e
+# allinea a post_max_size / SecRequestBodyLimit:
+#
+#   LimitRequestBody 10485760
+#   LimitRequestFields 50          # numero max di header HTTP della richiesta
+#
+# --- php.ini (o pool/.user.ini) --------------------------------------
+# Valori conservativi consigliati dall'advisory e dal buon senso:
+#   post_max_size = 10M              # = SecRequestBodyLimit
+#   max_input_vars = 500             # = SecArgumentsLimit
+#   max_input_nesting_level = 8      # default 64: ridurlo (adatta all'app)
+#   max_file_uploads = 10
+#   session.upload_progress.enabled = 0   # se non usi la barra di upload
+#
+# memory_limit: l'advisory cita "memory_limit=-1" come PRINCIPALE
+# mitigazione di configurazione per chi non puo' aggiornare, perche'
+# elimina il limite prevedibile che rende lo sfruttamento affidabile.
+# MA: non e' una mitigazione completa (se mmap() fallisce il percorso
+# vulnerabile resta) e apre a DoS per esaurimento memoria. Valutala
+# solo in assenza di alternative e controlla che nessun pool, .htaccess
+# o ini_set() ripristini un limite finito.
+# NON usare RLIMIT_AS / RLIMIT_DATA: fanno fallire mmap() e
+# riattivano proprio il percorso vulnerabile.
+#
+# --- mod_php vs PHP-FPM ----------------------------------------------
+# Con Apache + mod_php il rischio e' PIU' ALTO: lo shutdown della
+# richiesta viene eseguito anche se lo startup e' fallito, quindi
+# l'attacco funziona senza che giri codice applicativo.
+# Con PHP-FPM il worker viene terminato se lo startup fallisce (meglio),
+# ma l'advisory non esclude sfruttabilita' dopo lo startup.
+# Riavvia SEMPRE tutti i worker dopo ogni modifica.
+
+
+# =====================================================================
+# SEZIONE 10 - Come fare il TESTing
+# =====================================================================
+# Questi comandi NON sono exploit: verificano solo che le regole
+# scattino. In DetectionOnly cerca l'ID nel log; con SecRuleEngine On
+# aspettati i codici HTTP indicati.
+#
+# Regola 9100010 (multipart chunked)  -> atteso 400
+#   curl -i -H "Transfer-Encoding: chunked" -F "a=b" https://TUO-SITO/
+#
+# Regola 9100016 (upload-progress)    -> atteso 403
+#   curl -i -F "PHP_SESSION_UPLOAD_PROGRESS=test" -F "f=@/etc/hostname" https://TUO-SITO/
+#
+# Regola 9100015 (nesting)            -> atteso 400
+#   curl -i -d 'a[b][c][d][e]=1' https://TUO-SITO/
+#
+# Regola 9100014 (file vuoti)         -> atteso 413
+#   curl -i $(for i in 1 2 3 4 5 6 7; do printf -- '-F f%s=@/dev/null;filename= ' $i; done) https://TUO-SITO/
+#
+# Log da consultare:
+#   tail -f /var/log/apache2/modsec_audit.log     (Debian/Ubuntu)
+#   tail -f /var/log/httpd/modsec_audit.log       (RHEL/Rocky)
+#   grep -E 'CVE-2026-10961[89]' /var/log/apache2/modsec_audit.log
+#
+# Dopo i test: PATCH DI PHP (8.2.35 / 8.3.36 / 8.4.27 / 8.5.12) E
+# riavvio dei worker. Queste regole sono una mitigazione temporanea.
+
+#
+# dmzware.com - InfoSec, ICT/OT/IoT/STEM Consulting and Training
+#
