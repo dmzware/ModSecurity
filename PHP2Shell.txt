@@ -3,14 +3,10 @@
 #  Apache HTTP Server + ModSecurity 2.x  (mod_security2)
 # =====================================================================
 #
-#  COSA SONO QUESTE VULNERABILITA'
-#  -------------------------------
-#
 #  !!! LIMITI di queste rule !!!
-#  La mitigazione completa per CVE-2026-109618 / CVE-2026-109619 e' AGGIORNARE PHP e riavviare i worker.
-#  Un WAF in questo caso puo' solo
-#  ridurre la superficie d'attacco bloccando le condizioni che portano
-#  PHP in OOM (richieste multipart anomale) e rilevare gli effetti
+#  La mitigazione completa per CVE-2026-109618 / CVE-2026-109619 e' AGGIORNARE PHP e riavviare i worker,
+#  tuttavia un WAF in questo caso puo' ridurre la superficie d'attacco bloccando le condizioni che portano
+#  PHP in OOM (richieste multipart anomale) rilevandone gli effetti
 #  (cookie PHPSESSID anomali, raffiche di HTTP 500).
 #
 #  COME USARLO
